@@ -10,10 +10,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-host = '26.2.120.116'
-port = 63153
+host = 'localhost'
+port = 1234
 bots = []
 NAME_PREFIX = "GAYJIN.Sex"
+IGNORE_PLAYERS = ["Alex"]
 class Bot:
     def __init__(self, name,host,port):
         self.name = NAME_PREFIX + str(name)
@@ -53,7 +54,7 @@ class Bot:
         logger.info('[%s] Chat worker bắt đầu', self.name)
         while self.bot is not None:
             self.bot.chat("DIT ME MAY THANG BETA")
-            time.sleep(1)
+            time.sleep(2)
     def jumping(self):
         logger.info('[%s] Jump worker bắt đầu', self.name)
         while self.bot is not None:
@@ -70,7 +71,7 @@ class Bot:
                 for eid in self.bot.entities:
                     e = self.bot.entities[eid]
                     name = getattr(e, 'username', None)
-                    if not name or name == self.name or name.startswith(NAME_PREFIX):
+                    if not name or name in IGNORE_PLAYERS or name == self.name or name.startswith(NAME_PREFIX):
                         continue
                     d = self.bot.entity.position.distanceTo(e.position)
                     if best is None or d < best:
@@ -79,7 +80,7 @@ class Bot:
                 if target is not None:
                     self.bot.lookAt(target.position.offset(0, target.height, 0))
                     self.bot.setControlState('forward', True)
-                    if best < 3:
+                    if best < 5:
                         self.bot.attack(target)
                 else:
                     self.bot.setControlState('forward', False)
