@@ -1,15 +1,17 @@
-import threading
-import logging
 import json
-import math
-from pathlib import Path
+import logging
 import sys
-from javascript import require, On, terminate
+import threading
 import time
-mineflayer = require('./node_modules/mineflayer/index.js')
+from pathlib import Path
+
+from javascript import On, require, terminate
+
+from combat import Combat, distance_between
 
 MODE_LOOT = 'loot'
 MODE_COMBAT = 'combat'
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,69 +34,82 @@ LOOT_KEYWORDS = tuple(CONFIG['loot_keywords'] + CONFIG['weapon_keywords'])
 CONTAINER_BLOCKS = CONFIG['container_blocks']
 SEARCH_DISTANCE = CONFIG['search_distance']
 INTERACTION_DISTANCE = CONFIG['interaction_distance']
+
+
 class Bot:
-    def __init__(self, name,host,port):
+    def __init__(self, name, host, port):
         self.name = NAME_PREFIX + str(name)
         self.host = host
         self.port = port
         self.bot = None
-        self.last_attack = 0
+        self.combat = Combat(self.name, IGNORE_PLAYERS, NAME_PREFIX)
+        self.control_lock = threading.Lock()
         self.mode = MODE_LOOT
         self.running = False
         self.checked_containers = set()
 
     def set_mode(self, mode):
-        if mode in (MODE_LOOT, MODE_COMBAT):
-            self.mode = mode
-            logger.info('[%s] Mode: %s', self.name, mode)
-        return self.mode
+        with self.control_lock:
+            if mode in (MODE_LOOT, MODE_COMBAT) and mode != self.mode:
+                self.mode = mode
+                if self.bot is not None:
+                    self.bot.clearControlStates()
+                logger.info('[%s] Mode: %s', self.name, mode)
+            return self.mode
 
     def start(self):
+        mineflayer = require('./node_modules/mineflayer/index.js')
         self.running = True
-        logger.info('[%s] Đang tạo bot và kết nối tới %s:%s', self.name, self.host, self.port)
+        logger.info('[%s] Connecting to %s:%s', self.name, self.host, self.port)
         self.bot = mineflayer.createBot({
             'host': self.host,
             'port': self.port,
             'username': self.name,
             'version': '1.21.11',
             'auth': 'offline',
-            'hideErrors': False}
-            )
-        logger.info('[%s] Đã tạo bot, đăng ký event handlers', self.name)
+            'hideErrors': False,
+        })
+
         @On(self.bot, 'login')
         def login(*args):
-            logger.info('[%s] Login thành công', self.name)
+            logger.info('[%s] Login successful', self.name)
+
+        workers_started = False
+
         @On(self.bot, 'spawn')
         def spawn(*args):
-            logger.info('[%s] Đã spawn, khởi động các worker', self.name)
-            ##threading.Thread(target=self.sikibidi, daemon=True).start()
+            nonlocal workers_started
+            if workers_started:
+                return
+            workers_started = True
+            logger.info('[%s] Spawned; starting workers', self.name)
             threading.Thread(target=self.jumping, daemon=True).start()
             threading.Thread(target=self.chasing, daemon=True).start()
             threading.Thread(target=self.inventory, daemon=True).start()
+
         @On(self.bot, 'error')
         def error(*args):
             logger.error('[%s] Mineflayer error: %s', self.name, args[-1] if args else 'unknown')
+
         @On(self.bot, 'kicked')
         def kicked(*args):
-            logger.warning('[%s] Bị kick: %s', self.name, args[-1] if args else 'unknown')
+            logger.warning('[%s] Kicked: %s', self.name, args[-1] if args else 'unknown')
+
         @On(self.bot, 'end')
         def end(*args):
-            logger.warning('[%s] Kết nối đã kết thúc', self.name)
+            logger.warning('[%s] Connection ended', self.name)
             self.running = False
 
-    def sikibidi(self):
-        logger.info('[%s] Chat worker bắt đầu', self.name)
-        while self.running:
-            self.bot.chat("Some time i dream of saving a world...")
-            time.sleep(1)
-            self.bot.chat("Saving people from the invisible hand...")
-            time.sleep(10)
     def jumping(self):
-        logger.info('[%s] Jump worker bắt đầu', self.name)
+        logger.info('[%s] Jump worker started', self.name)
         while self.running:
-            self.bot.setControlState('jump', True)
+            with self.control_lock:
+                if self.mode == MODE_LOOT:
+                    self.bot.setControlState('jump', True)
             time.sleep(0.1)
-            self.bot.setControlState('jump', False)
+            with self.control_lock:
+                if self.mode == MODE_LOOT:
+                    self.bot.setControlState('jump', False)
             time.sleep(0.1)
 
     def inventory(self):
@@ -102,22 +117,22 @@ class Bot:
         while self.running:
             try:
                 items = list(self.bot.inventory.items())
-                apple = None
+                food = None
                 if self.bot.health < 16:
-                    apple = next((item for item in items if getattr(item, 'name', '') == 'golden_apple'), None)
-                    if apple:
-                        self.bot.equip(apple, 'hand')
-                        self.bot.consume()
-                if self.bot.food <= 14 and not apple:
+                    food = next((item for item in items if getattr(item, 'name', '') == 'golden_apple'), None)
+                if food is None and self.bot.food <= 14:
                     food = next((item for item in items if self.is_food(getattr(item, 'name', ''))), None)
-                    if food:
+                if food is not None:
+                    with self.combat.hand_lock:
                         self.bot.equip(food, 'hand')
+                        self.combat.last_weapon_swap = time.monotonic()
                         self.bot.consume()
 
                 armor = {
                     destination: self.bot.inventory.slots[self.bot.getEquipmentDestSlot(destination)]
                     for destination in ('head', 'torso', 'legs', 'feet')
                 }
+                weapons = []
                 for item in items:
                     name = getattr(item, 'name', '')
                     if 'helmet' in name:
@@ -129,13 +144,16 @@ class Bot:
                     elif 'boots' in name:
                         destination = 'feet'
                     elif self.is_weapon(name):
-                        self.bot.equip(item, 'hand')
+                        weapons.append(item)
                         continue
                     else:
                         continue
                     if not armor[destination]:
                         self.bot.equip(item, destination)
                         armor[destination] = item
+
+                if weapons:
+                    self.combat.equip_weapon(self.bot, weapons, prefer_sword=self.mode == MODE_COMBAT)
 
                 if self.mode == MODE_LOOT:
                     block_ids = []
@@ -146,17 +164,23 @@ class Bot:
                             continue
                     if block_ids:
                         positions = self.find_container_positions(block_ids)
-                        self.bot.setControlState('forward', False)
+                        with self.control_lock:
+                            if self.mode == MODE_LOOT:
+                                self.bot.setControlState('forward', False)
                         for position in positions:
+                            if self.mode != MODE_LOOT:
+                                break
                             block = self.bot.blockAt(position)
                             if not block:
                                 continue
                             key = self.container_key(block)
                             if key in self.checked_containers:
                                 continue
-                            if self.distance_between(self.bot.entity.position, block.position) > INTERACTION_DISTANCE:
-                                self.bot.lookAt(block.position.offset(0, 0.5, 0))
-                                self.bot.setControlState('forward', True)
+                            if distance_between(self.bot.entity.position, block.position) > INTERACTION_DISTANCE:
+                                with self.control_lock:
+                                    if self.mode == MODE_LOOT:
+                                        self.bot.lookAt(block.position.offset(0, 0.5, 0), True)
+                                        self.bot.setControlState('forward', True)
                                 break
                             valuable = self.loot_container(self.bot.openContainer(block))
                             self.checked_containers.add(key)
@@ -182,13 +206,6 @@ class Bot:
         position = block.position
         return int(position.x), int(position.y), int(position.z)
 
-    @staticmethod
-    def distance_between(first, second):
-        return math.dist(
-            (float(first.x), float(first.y), float(first.z)),
-            (float(second.x), float(second.y), float(second.z)),
-        )
-
     @classmethod
     def has_valuable_items(cls, items):
         return any(cls.is_loot(getattr(item, 'name', '')) for item in items)
@@ -200,7 +217,10 @@ class Bot:
                 return False
             for item in items:
                 if self.is_loot(getattr(item, 'name', '')):
-                    container.withdraw(item.type, getattr(item, 'metadata', None), item.count)
+                    try:
+                        container.withdraw(item.type, getattr(item, 'metadata', None), item.count)
+                    except Exception as error:
+                        logger.warning('[%s] Could not withdraw %s: %s', self.name, getattr(item, 'name', 'item'), error)
             return True
         finally:
             container.close()
@@ -214,38 +234,18 @@ class Bot:
         return name == 'golden_apple' or cls.is_food(name) or any(part in name for part in LOOT_KEYWORDS)
 
     def chasing(self):
-        logger.info('[%s] Chase worker bắt đầu', self.name)
+        logger.info('[%s] Chase worker started', self.name)
         while self.running:
             try:
-                if self.mode != MODE_COMBAT:
-                    time.sleep(0.1)
-                    continue
-                target = None
-                best = None
-                for eid in self.bot.entities:
-                    e = self.bot.entities[eid]
-                    name = getattr(e, 'username', None)
-                    if not name or name in IGNORE_PLAYERS or name == self.name or name.startswith(NAME_PREFIX):
-                        continue
-                    d = self.distance_between(self.bot.entity.position, e.position)
-                    if best is None or d < best:
-                        best = d
-                        target = e
-                if target is not None:
-                    self.bot.lookAt(target.position.offset(0, target.height, 0))
-                    self.bot.setControlState('forward', True)
-                    held_name = getattr(getattr(self.bot, 'heldItem', None), 'name', '')
-                    cooldown = 0.65 if 'sword' in held_name else 1.0
-                    now = time.monotonic()
-                    if best < 5 and now - self.last_attack >= cooldown:
-                        self.bot.attack(target)
-                        self.last_attack = now
-                else:
-                    self.bot.setControlState('forward', False)
+                if self.mode == MODE_COMBAT:
+                    target, distance = self.combat.find_target(self.bot)
+                    with self.control_lock:
+                        if self.running and self.mode == MODE_COMBAT:
+                            self.combat.tick(self.bot, target, distance, time.monotonic())
             except Exception:
-                logger.exception('[%s] Lỗi trong chase worker', self.name)
-            time.sleep(0.1)
-        
+                logger.exception('[%s] Error in chase worker', self.name)
+            time.sleep(0.05)
+
 
 def handle_command(bot, command):
     mode = {'1': MODE_LOOT, '2': MODE_COMBAT}.get(command)
@@ -275,7 +275,7 @@ def read_commands():
 
 
 def main():
-    for i in range(0, 1):
+    for i in range(1):
         bot = Bot(i, host, port)
         bot.start()
         bots.append(bot)
