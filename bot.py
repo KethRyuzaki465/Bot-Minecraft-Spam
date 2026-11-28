@@ -7,10 +7,12 @@ from pathlib import Path
 
 from javascript import On, require, terminate
 
-from combat import Combat, distance_between
+from combat import Combat, HEALING_APPLES, distance_between
+from navigation import Navigation
 
 MODE_LOOT = 'loot'
 MODE_COMBAT = 'combat'
+BOT_NAMES = ['Sonion0', 'bot_saygex', 'sondulovuong']
 
 
 logging.basicConfig(
@@ -26,7 +28,6 @@ with CONFIG_PATH.open(encoding='utf-8') as config_file:
 host = CONFIG['host']
 port = CONFIG['port']
 bots = []
-NAME_PREFIX = CONFIG['name_prefix']
 IGNORE_PLAYERS = CONFIG['ignore_players']
 FOOD_ITEMS = set(CONFIG['food_items'])
 WEAPON_KEYWORDS = tuple(CONFIG['weapon_keywords'])
@@ -37,13 +38,16 @@ INTERACTION_DISTANCE = CONFIG['interaction_distance']
 
 
 class Bot:
-    def __init__(self, name, host, port):
-        self.name = NAME_PREFIX + str(name)
+    def __init__(self, name, host, port, *, difficulty=None):
+        self.name = name
         self.host = host
         self.port = port
         self.bot = None
-        self.combat = Combat(self.name, IGNORE_PLAYERS, NAME_PREFIX)
+        self.navigation = None
         self.control_lock = threading.Lock()
+        if difficulty is None:
+            difficulty = CONFIG.get('bot_difficulty', 'standard')
+        self.combat = Combat(self.name, IGNORE_PLAYERS, BOT_NAMES, self.control_lock, difficulty)
         self.mode = MODE_LOOT
         self.running = False
         self.checked_containers = set()
@@ -52,15 +56,20 @@ class Bot:
         with self.control_lock:
             if mode in (MODE_LOOT, MODE_COMBAT) and mode != self.mode:
                 self.mode = mode
+                self.combat.reset_expert_read()
                 if self.bot is not None:
+                    if self.navigation is not None:
+                        self.navigation.stop()
                     self.bot.clearControlStates()
                 logger.info('[%s] Mode: %s', self.name, mode)
             return self.mode
 
     def start(self):
         mineflayer = require('./node_modules/mineflayer/index.js')
+        pathfinder = require('./node_modules/mineflayer-pathfinder/index.js')
+        retreat_hop = require('./retreat_hop.js')
         self.running = True
-        logger.info('[%s] Connecting to %s:%s', self.name, self.host, self.port)
+        logger.info('[%s] Connecting to %s:%s with %s difficulty', self.name, self.host, self.port, self.combat.difficulty)
         self.bot = mineflayer.createBot({
             'host': self.host,
             'port': self.port,
@@ -69,6 +78,7 @@ class Bot:
             'auth': 'offline',
             'hideErrors': False,
         })
+        self.bot.loadPlugin(pathfinder.pathfinder)
 
         @On(self.bot, 'login')
         def login(*args):
@@ -81,9 +91,10 @@ class Bot:
             nonlocal workers_started
             if workers_started:
                 return
+            with self.control_lock:
+                self.navigation = Navigation(self.bot, pathfinder, retreat_hop)
             workers_started = True
             logger.info('[%s] Spawned; starting workers', self.name)
-            threading.Thread(target=self.jumping, daemon=True).start()
             threading.Thread(target=self.chasing, daemon=True).start()
             threading.Thread(target=self.inventory, daemon=True).start()
 
@@ -100,33 +111,22 @@ class Bot:
             logger.warning('[%s] Connection ended', self.name)
             self.running = False
 
-    def jumping(self):
-        logger.info('[%s] Jump worker started', self.name)
-        while self.running:
-            with self.control_lock:
-                if self.mode == MODE_LOOT:
-                    self.bot.setControlState('jump', True)
-            time.sleep(0.1)
-            with self.control_lock:
-                if self.mode == MODE_LOOT:
-                    self.bot.setControlState('jump', False)
-            time.sleep(0.1)
-
     def inventory(self):
         logger.info('[%s] Inventory worker started', self.name)
         while self.running:
             try:
-                items = list(self.bot.inventory.items())
-                food = None
-                if self.bot.health < 16:
-                    food = next((item for item in items if getattr(item, 'name', '') == 'golden_apple'), None)
-                if food is None and self.bot.food <= 14:
+                inventory = self.bot.inventory
+                items = list(inventory.items())
+                healed = self.combat.consume_healing_apple(
+                    self.bot, items, self.navigation, combat_mode=self.mode == MODE_COMBAT
+                )
+                if not healed and self.bot.food <= 14:
                     food = next((item for item in items if self.is_food(getattr(item, 'name', ''))), None)
-                if food is not None:
-                    with self.combat.hand_lock:
-                        self.bot.equip(food, 'hand')
-                        self.combat.last_weapon_swap = time.monotonic()
-                        self.bot.consume()
+                    if food is not None:
+                        with self.combat.hand_lock:
+                            self.bot.equip(food, 'hand')
+                            self.combat.last_weapon_swap = time.monotonic()
+                            self.bot.consume()
 
                 armor = {
                     destination: self.bot.inventory.slots[self.bot.getEquipmentDestSlot(destination)]
@@ -156,36 +156,7 @@ class Bot:
                     self.combat.equip_weapon(self.bot, weapons, prefer_sword=self.mode == MODE_COMBAT)
 
                 if self.mode == MODE_LOOT:
-                    block_ids = []
-                    for name in CONTAINER_BLOCKS:
-                        try:
-                            block_ids.append(self.bot.registry.blocksByName[name].id)
-                        except (KeyError, TypeError):
-                            continue
-                    if block_ids:
-                        positions = self.find_container_positions(block_ids)
-                        with self.control_lock:
-                            if self.mode == MODE_LOOT:
-                                self.bot.setControlState('forward', False)
-                        for position in positions:
-                            if self.mode != MODE_LOOT:
-                                break
-                            block = self.bot.blockAt(position)
-                            if not block:
-                                continue
-                            key = self.container_key(block)
-                            if key in self.checked_containers:
-                                continue
-                            if distance_between(self.bot.entity.position, block.position) > INTERACTION_DISTANCE:
-                                with self.control_lock:
-                                    if self.mode == MODE_LOOT:
-                                        self.bot.lookAt(block.position.offset(0, 0.5, 0), True)
-                                        self.bot.setControlState('forward', True)
-                                break
-                            valuable = self.loot_container(self.bot.openContainer(block))
-                            self.checked_containers.add(key)
-                            if valuable:
-                                break
+                    self.loot_nearby_containers()
             except Exception:
                 logger.exception('[%s] Error in inventory worker', self.name)
             time.sleep(2)
@@ -200,6 +171,45 @@ class Bot:
             'maxDistance': SEARCH_DISTANCE,
             'count': 16,
         }))
+
+    def loot_nearby_containers(self):
+        block_ids = []
+        for name in CONTAINER_BLOCKS:
+            block = self.bot.registry.blocksByName[name]
+            if block is not None:
+                block_ids.append(block.id)
+
+        pending = []
+        for position in self.find_container_positions(block_ids) if block_ids else ():
+            if self.mode != MODE_LOOT:
+                return
+            block = self.bot.blockAt(position)
+            if not block:
+                continue
+            key = self.container_key(block)
+            if key in self.checked_containers:
+                continue
+            if (distance_between(self.bot.entity.position, block.position) > INTERACTION_DISTANCE
+                    or not self.bot.canSeeBlock(block)):
+                pending.append(block.position)
+                continue
+
+            with self.control_lock:
+                if self.mode != MODE_LOOT:
+                    return
+                self.navigation.stop()
+            valuable = self.loot_container(self.bot.openContainer(block))
+            self.checked_containers.add(key)
+            if valuable:
+                return
+
+        with self.control_lock:
+            if self.mode != MODE_LOOT:
+                return
+            if pending:
+                self.navigation.approach_containers(pending, INTERACTION_DISTANCE)
+            else:
+                self.navigation.stop()
 
     @staticmethod
     def container_key(block):
@@ -231,7 +241,7 @@ class Bot:
 
     @classmethod
     def is_loot(cls, name):
-        return name == 'golden_apple' or cls.is_food(name) or any(part in name for part in LOOT_KEYWORDS)
+        return name in HEALING_APPLES or cls.is_food(name) or any(part in name for part in LOOT_KEYWORDS)
 
     def chasing(self):
         logger.info('[%s] Chase worker started', self.name)
@@ -241,19 +251,21 @@ class Bot:
                     target, distance = self.combat.find_target(self.bot)
                     with self.control_lock:
                         if self.running and self.mode == MODE_COMBAT:
-                            self.combat.tick(self.bot, target, distance, time.monotonic())
+                            self.combat.tick(self.bot, target, distance, time.monotonic(), self.navigation)
             except Exception:
                 logger.exception('[%s] Error in chase worker', self.name)
             time.sleep(0.05)
 
 
-def handle_command(bot, command):
+def handle_command(roster, command):
     mode = {'1': MODE_LOOT, '2': MODE_COMBAT}.get(command)
-    return bot.set_mode(mode) if mode else bot.mode
+    if mode:
+        for current in roster:
+            current.set_mode(mode)
 
 
 def read_commands():
-    logger.info('Press 1 for loot mode, 2 for combat mode.')
+    logger.info('Press 1 for loot mode or 2 for combat mode for all bots.')
     try:
         if sys.platform == 'win32':
             import msvcrt
@@ -263,25 +275,26 @@ def read_commands():
                     for bot in bots:
                         bot.running = False
                     return
-                handle_command(bots[0], command)
+                handle_command(bots, command)
         else:
             while True:
                 command = sys.stdin.read(1)
                 if not command:
                     return
-                handle_command(bots[0], command)
+                handle_command(bots, command)
     except (EOFError, KeyboardInterrupt):
         return
 
 
 def main():
-    for i in range(1):
-        bot = Bot(i, host, port)
-        bot.start()
-        bots.append(bot)
-        time.sleep(1)
-    threading.Thread(target=read_commands, daemon=True).start()
     try:
+        for name in BOT_NAMES:
+            bot = Bot(name, host, port)
+            bots.append(bot)
+            bot.start()
+            time.sleep(1)
+        if bots:
+            threading.Thread(target=read_commands, daemon=True).start()
         while any(bot.running for bot in bots):
             time.sleep(0.5)
     finally:

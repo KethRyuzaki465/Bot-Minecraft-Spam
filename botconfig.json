@@ -1,7 +1,7 @@
 {
   "host": "localhost",
   "port": 11111,
-  "name_prefix": "Sonion",
+  "bot_difficulty": "expert",
   "ignore_players": [
     "HanBelgei",
     "KIMOCHURA",

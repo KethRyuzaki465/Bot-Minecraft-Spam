@@ -3,4 +3,7 @@ node_modules/
 vexbot_PVP_Training/
 AI_CONTEXT/
 __pycache__/
-test_bot.py/
+test_bot.py
+test_retreat_hop.js
+package.json
+retreat_hop.js
