@@ -1,0 +1,68 @@
+{
+  "host": "localhost",
+  "port": 11111,
+  "name_prefix": "Sonion",
+  "ignore_players": [
+    "HanBelgei",
+    "KIMOCHURA",
+    "Cugoson1",
+    "Songocu"
+  ],
+  "food_items": [
+    "bread",
+    "apple",
+    "carrot",
+    "golden_carrot",
+    "potato",
+    "baked_potato",
+    "beetroot",
+    "melon_slice",
+    "sweet_berries",
+    "glow_berries",
+    "cookie",
+    "cooked_beef",
+    "cooked_porkchop",
+    "cooked_chicken",
+    "cooked_mutton",
+    "cooked_rabbit",
+    "cooked_cod",
+    "cooked_salmon",
+    "dried_kelp",
+    "pumpkin_pie",
+    "beef",
+    "porkchop",
+    "chicken",
+    "mutton",
+    "rabbit",
+    "cod",
+    "salmon",
+    "tropical_fish",
+    "pufferfish",
+    "mushroom_stew",
+    "beetroot_soup",
+    "rabbit_stew",
+    "suspicious_stew",
+    "honey_bottle",
+    "chorus_fruit"
+  ],
+  "weapon_keywords": [
+    "sword",
+    "axe",
+    "bow",
+    "crossbow",
+    "trident"
+  ],
+  "loot_keywords": [
+    "helmet",
+    "chestplate",
+    "leggings",
+    "boots"
+  ],
+  "container_blocks": [
+    "chest",
+    "trapped_chest",
+    "shulker_box"
+  ],
+  "search_distance": 16,
+  "interaction_distance": 4
+}
